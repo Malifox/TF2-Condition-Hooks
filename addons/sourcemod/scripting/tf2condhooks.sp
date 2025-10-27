@@ -5,41 +5,80 @@
 #include <sdktools>
 #include <dhooks>
 #include <tf2condhooks>
-
-#define ptr 				Address
-#define nullptr 			Address_Null
-#define int(%1) 			view_as< int >(%1)
-#define Address(%1) 		view_as< Address >(%1)
+#include <virtual_address>
 
 public Plugin myinfo =
 {
 	name = "[TF2] Condition Manager",
-	author = "Scag",
+	author = "Scag, Malifox", // Original by Scag, x64 compatibility rewrite by Malifox
 	description = "Condition add and removal control for developers",
-	version = "1.0.0",
+	version = "1.1.0",
 	url = "https://github.com/Scags/"
 };
 
-GlobalForward hAddCond;
-GlobalForward hRemoveCond;
+GlobalForward g_gfAddCond;
+GlobalForward g_gfRemoveCond;
+
+Address g_iOffset_m_pOuter; 	//CTFPlayerShared::m_pOuter
+Address g_iOffset_m_RefEHandle;	//CBaseEntity::m_RefEHandle
+Address g_iOffset_m_ConditionData; //CTFPlayerShared::m_ConditionData.m_Memory, CUtlVector< condition_source_t > + 0
+
+enum struct condition_source_t // Offsets within CTFPlayerShared::m_ConditionData.m_Memory
+{
+	Address m_flExpireTime;
+	Address m_pProvider;
+	int iSizeOf;
+
+	void Init()
+	{
+		// vfptr = 0
+		// this.m_nPreventedDamageFromCondition = PointerSize; // int
+
+		if (PointerSize == view_as<Address>(8))
+		{
+			this.m_flExpireTime = view_as<Address>(12);		// float
+			this.m_pProvider = view_as<Address>(16);		// CNetworkHandle( CBaseEntity, m_pProvider )
+			// this.m_bPrevActive = view_as<Address>(20);	// bool
+			this.iSizeOf = 24;
+		}
+		else
+		{
+			this.m_flExpireTime = view_as<Address>(8);
+			this.m_pProvider = view_as<Address>(12);
+			// this.m_bPrevActive = view_as<Address>(16);
+			this.iSizeOf = 20;
+		}
+	}
+}
+condition_source_t g_condition_source_t;
 
 public APLRes AskPluginLoad2(Handle self, bool late, char[] error, int max)
 {
-	hAddCond = new GlobalForward("TF2_OnAddCond", ET_Hook, Param_Cell, Param_CellByRef, Param_FloatByRef, Param_CellByRef);
-	hRemoveCond = new GlobalForward("TF2_OnRemoveCond", ET_Hook, Param_Cell, Param_CellByRef, Param_FloatByRef, Param_CellByRef);
+	g_gfAddCond = new GlobalForward("TF2_OnAddCond", ET_Hook, Param_Cell, Param_CellByRef, Param_FloatByRef, Param_CellByRef);
+	g_gfRemoveCond = new GlobalForward("TF2_OnRemoveCond", ET_Hook, Param_Cell, Param_CellByRef, Param_FloatByRef, Param_CellByRef);
 	RegPluginLibrary("tf2condhooks");
 	return APLRes_Success;
 }
 
 public void OnPluginStart()
 {
-	GameData conf = new GameData("tf2.condmgr");
-	Handle h = DHookCreateDetourEx(conf, "CTFPlayerShared::AddCond", CallConv_THISCALL, ReturnType_Void, ThisPointer_Address);
-	DHookAddParam(h, HookParamType_Int);
-	DHookAddParam(h, HookParamType_Float);
-	DHookAddParam(h, HookParamType_Int);	// Pass as Int so null providers aren't "world"
-	if (!DHookEnableDetour(h, false, CTFPlayerShared_AddCond))
-		SetFailState("Could not load hook for CTFPlayerShared::AddCond!");
+	g_iOffset_m_pOuter = view_as<Address>(FindSendPropInfo("CTFPlayer", "m_nHalloweenBombHeadStage") - FindSendPropInfo("CTFPlayer", "m_Shared") + 4);
+	g_iOffset_m_ConditionData = PointerSize + PointerSize; // 8 / 16. vfptr + 1(bool) + padding
+	g_condition_source_t.Init();
+
+	GameData gamedata = new GameData("tf2.condmgr");
+	if (!gamedata)
+		SetFailState("Failed to find gamedata/tf2.condmgr.txt");
+
+	DynamicDetour detour = DynamicDetour.FromConf(gamedata, "CTFPlayerShared::AddCond()");
+	if (!detour || !detour.Enable(Hook_Pre, CTFPlayerShared_AddCond))
+		SetFailState("Could not load hook for CTFPlayerShared::AddCond()!");
+	delete detour;
+
+	detour = DynamicDetour.FromConf(gamedata, "CTFPlayerShared::RemoveCond()");
+	if (!detour || !detour.Enable(Hook_Pre, CTFPlayerShared_RemoveCond))
+		SetFailState("Could not load hook for CTFPlayerShared::RemoveCond()!");
+	delete detour;
 
 //	h = DHookCreateDetourEx(conf, "CTFConditionList::Remove", CallConv_THISCALL, ReturnType_Bool, ThisPointer_Address);
 //	DHookAddParam(h, HookParamType_Int);
@@ -47,28 +86,28 @@ public void OnPluginStart()
 //	if (!DHookEnableDetour(h, false, CTFConditionList_Remove))
 //		SetFailState("Could not load hook for CTFConditionList::Remove!");
 
-	h = DHookCreateDetourEx(conf, "CTFPlayerShared::RemoveCond", CallConv_THISCALL, ReturnType_Void, ThisPointer_Address);
-	DHookAddParam(h, HookParamType_Int);
-	DHookAddParam(h, HookParamType_Bool);
-	if (!DHookEnableDetour(h, false, CTFPlayerShared_RemoveCond))
-		SetFailState("Could not load hook for CTFPlayerShared::RemoveCond!");
-
-	delete conf;
+	delete gamedata;
 }
 
-public MRESReturn CTFPlayerShared_AddCond(Address pThis, Handle hParams)
+public void OnMapStart()
 {
-	ptr m_pOuter = ptr(FindSendPropInfo("CTFPlayer", "m_nHalloweenBombHeadStage") - FindSendPropInfo("CTFPlayer", "m_Shared") + 4);
-	int client = GetEntityFromAddress(ptr(Dereference(pThis + m_pOuter)));
-	TFCond cond = DHookGetParam(hParams, 1);
-	float time = DHookGetParam(hParams, 2);
-	int provider = !DHookGetParam(hParams, 3) ? -1 : GetEntityFromAddress(DHookGetParam(hParams, 3));
-	Action action;
+	if (!g_iOffset_m_RefEHandle)
+		g_iOffset_m_RefEHandle = view_as<Address>(FindDataMapInfo(0, "m_angRotation") + 12);
+}
 
-	if (!client || !IsClientInGame(client) || !IsPlayerAlive(client))	// Sanity check
+MRESReturn CTFPlayerShared_AddCond(Address pThis, DHookParam hParams)
+{
+	int client = LoadEntityFromHandleAddress(LoadAddressFromAddress(pThis + g_iOffset_m_pOuter) + g_iOffset_m_RefEHandle);
+
+	if (client <= 0 || !IsClientInGame(client) || !IsPlayerAlive(client))	// Sanity check
 		return MRES_Ignored;
 
-	Call_StartForward(hAddCond);
+	TFCond cond = hParams.Get(1);
+	float time = hParams.Get(2);
+	int provider = hParams.IsNull(3) ? -1 : hParams.Get(3);
+
+	Action action;
+	Call_StartForward(g_gfAddCond);
 	Call_PushCell(client);
 	Call_PushCellRef(cond);
 	Call_PushFloatRef(time);
@@ -77,11 +116,9 @@ public MRESReturn CTFPlayerShared_AddCond(Address pThis, Handle hParams)
 
 	if (action == Plugin_Changed)
 	{
-		DHookSetParam(hParams, 1, cond);
-		DHookSetParam(hParams, 2, time);
-		if (provider == -1 || provider == 0xFFF)
-			provider = 0;
-		DHookSetParam(hParams, 3, provider == 0 ? provider : view_as< int >(GetEntityAddress(provider)));	// Fucking ok
+		hParams.Set(1, cond);
+		hParams.Set(2, time);
+		hParams.Set(3, provider);
 		return MRES_ChangedHandled;
 	}
 	else if (action >= Plugin_Handled)
@@ -90,39 +127,29 @@ public MRESReturn CTFPlayerShared_AddCond(Address pThis, Handle hParams)
 	return MRES_Ignored;
 }
 
-public MRESReturn CTFPlayerShared_RemoveCond(Address pThis, Handle hParams)
+MRESReturn CTFPlayerShared_RemoveCond(Address pThis, DHookParam hParams)
 {
-	ptr m_pOuter = ptr(FindSendPropInfo("CTFPlayer", "m_nHalloweenBombHeadStage") - FindSendPropInfo("CTFPlayer", "m_Shared") + 4);
-	int client = GetEntityFromAddress(ptr(Dereference(pThis + m_pOuter)));
-	TFCond cond = DHookGetParam(hParams, 1);
-//	bool ignore_duration = DHookGetParam(hParams, 2);	// Unused
+	int client = LoadEntityFromHandleAddress(LoadAddressFromAddress(pThis + g_iOffset_m_pOuter) + g_iOffset_m_RefEHandle);
+	TFCond cond = hParams.Get(1);
+//	bool ignore_duration = hParams.Get(2);	// Unused
 	Action action;
 
 	// Sanity checks
-	if (!client || !IsClientInGame(client) || !IsPlayerAlive(client) || !TF2_IsPlayerInCondition(client, cond))
+	if (client <= 0 || !IsClientInGame(client) || !IsPlayerAlive(client) || !TF2_IsPlayerInCondition(client, cond))
 		return MRES_Ignored;
 
-//	int	m_nPreventedDamageFromCondition;
-//	float	m_flExpireTime;
-//	CNetworkHandle( CBaseEntity, m_pProvider );
-//	bool	m_bPrevActive;
+	Address m_ConditionData_m_Memory = LoadAddressFromAddress(pThis + g_iOffset_m_ConditionData);
+	Address offset = view_as<Address>(view_as<int>(cond) * g_condition_source_t.iSizeOf);
+	Address m_ConditionData_m_Memory_cond = m_ConditionData_m_Memory + offset;
 
-	ptr m_ConditionData = ptr(Dereference(pThis, 8));
-	int offset = view_as< int >(cond) * 20;
-//	ptr pCond = ptr(Dereference(m_ConditionData, offset));
-	float timeleft = view_as< float >(Dereference(m_ConditionData, offset + 8));
-	int provider = Dereference(m_ConditionData, offset + 12) & 0xFFF;
-
-	// Keep accustom to all the regular sourcemod shiz and make NULL ents -1
-	// 4095 provider is -1
-	if (provider == 0xFFF || !provider)
-		provider = -1;
+	float timeleft = LoadFromAddress(m_ConditionData_m_Memory_cond + g_condition_source_t.m_flExpireTime, NumberType_Int32);
+	int provider = LoadEntityFromHandleAddress(m_ConditionData_m_Memory_cond + g_condition_source_t.m_pProvider);
 
 	// Have to baby these coders that assume what they do will actually work
 	float oldtime = timeleft;
 	TFCond oldcond = cond;
 
-	Call_StartForward(hRemoveCond);
+	Call_StartForward(g_gfRemoveCond);
 	Call_PushCell(client);
 	Call_PushCellRef(cond);
 //	Call_PushCellRef(ignore_duration);
@@ -132,14 +159,18 @@ public MRESReturn CTFPlayerShared_RemoveCond(Address pThis, Handle hParams)
 
 	if (action == Plugin_Changed)
 	{
-		DHookSetParam(hParams, 1, cond);
+		if (cond != oldcond)
+		{
+			hParams.Set(1, cond);
+			offset = view_as<Address>(view_as<int>(cond) * g_condition_source_t.iSizeOf);
+			m_ConditionData_m_Memory_cond = m_ConditionData_m_Memory + offset;
+		}
 
 		// If cond was changed, make sure they're in this cond
 		if (TF2_IsPlayerInCondition(client, cond))
 		{
-			offset = view_as< int >(cond) * 20;
-			StoreToAddress(Transpose(m_ConditionData, offset + 8), view_as< int >(timeleft), NumberType_Int32);
-			StoreToAddress(Transpose(m_ConditionData, offset + 12), view_as< int >(GetEHandle(provider)), NumberType_Int32);
+			StoreToAddress(m_ConditionData_m_Memory_cond + g_condition_source_t.m_flExpireTime, timeleft, NumberType_Int32);
+			StoreEntityToHandleAddress(m_ConditionData_m_Memory_cond + g_condition_source_t.m_pProvider, provider);
 		}
 
 		// If they only changed the time and return Changed, supercede to prevent removal
@@ -153,6 +184,11 @@ public MRESReturn CTFPlayerShared_RemoveCond(Address pThis, Handle hParams)
 
 	return MRES_Ignored;
 }
+
+// #define ptr 				Address
+// #define nullptr 			Address_Null
+// #define int(%1) 			view_as<int>(%1)
+// #define Address(%1) 		view_as<Address>(%1)
 
 // Hours of my life I'm not getting back
 #if 0
@@ -209,7 +245,7 @@ public MRESReturn CTFConditionList_Remove(Address pThis, Handle hReturn, Handle 
 	if (provider == 0xFFF || !provider)
 		provider = -1;
 
-	Call_StartForward(hRemoveCond);
+	Call_StartForward(g_gfRemoveCond);
 	Call_PushCell(client);
 	Call_PushCell(cond);
 //	Call_PushCellRef(ignore_duration);
@@ -243,43 +279,43 @@ public MRESReturn CTFConditionList_Remove(Address pThis, Handle hReturn, Handle 
 }
 #endif
 
-stock Handle DHookCreateDetourEx(GameData conf, const char[] name, CallingConvention callConv, ReturnType returntype, ThisPointerType thisType)
-{
-	Handle h = DHookCreateDetour(Address_Null, callConv, returntype, thisType);
-	if (h)
-		if (!DHookSetFromConf(h, conf, SDKConf_Signature, name))
-			SetFailState("Could not set %s from config!", name);
-	return h;
-}
+// stock Handle DHookCreateDetourEx(GameData conf, const char[] name, CallingConvention callConv, ReturnType returntype, ThisPointerType thisType)
+// {
+// 	Handle h = DHookCreateDetour(Address_Null, callConv, returntype, thisType);
+// 	if (h)
+// 		if (!DHookSetFromConf(h, conf, SDKConf_Signature, name))
+// 			SetFailState("Could not set %s from config!", name);
+// 	return h;
+// }
 
 // Props to nosoop
-stock int GetEntityFromAddress(ptr pEntity)
-{
-	return Dereference(pEntity, FindDataMapInfo(0, "m_angRotation") + 12) & 0xFFF;
-}
+// stock int GetEntityFromAddress(ptr pEntity)
+// {
+// 	return Dereference(pEntity, FindDataMapInfo(0, "m_angRotation") + 12) & 0xFFF;
+// }
 
-stock Address GetEHandle(int entity)
-{
-	if (entity == -1)
-		return ptr(-1);
-	return ptr(Dereference(GetEntityAddress(entity), FindDataMapInfo(0, "m_angRotation") + 12));
-}
+// stock Address GetEHandle(int entity)
+// {
+// 	if (entity == -1)
+// 		return ptr(-1);
+// 	return ptr(Dereference(GetEntityAddress(entity), FindDataMapInfo(0, "m_angRotation") + 12));
+// }
 
-stock int ReadInt(ptr pAddr)
-{
-	if (pAddr == nullptr)
-		return -1;
+// stock int ReadInt(ptr pAddr)
+// {
+// 	if (pAddr == nullptr)
+// 		return -1;
 
-	return LoadFromAddress(pAddr, NumberType_Int32);
-}
-stock ptr Transpose(ptr pAddr, int iOffset)
-{
-	return ptr(int(pAddr) + iOffset);
-}
-stock int Dereference(ptr pAddr, int iOffset = 0)
-{
-	if (pAddr == nullptr)
-		return -1;
+// 	return LoadFromAddress(pAddr, NumberType_Int32);
+// }
+// stock ptr Transpose(ptr pAddr, int iOffset)
+// {
+// 	return ptr(int(pAddr) + iOffset);
+// }
+// stock int Dereference(ptr pAddr, int iOffset = 0)
+// {
+// 	if (pAddr == nullptr)
+// 		return -1;
 
-	return ReadInt(Transpose(pAddr, iOffset));
-}
+// 	return ReadInt(Transpose(pAddr, iOffset));
+// }
