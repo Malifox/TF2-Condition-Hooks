@@ -11,12 +11,12 @@
 #define int(%1) 			view_as< int >(%1)
 #define Address(%1) 		view_as< Address >(%1)
 
-public Plugin myinfo = 
+public Plugin myinfo =
 {
-	name = "[TF2] Condition Manager", 
-	author = "Scag", 
-	description = "Condition add and removal control for developers", 
-	version = "1.0.0", 
+	name = "[TF2] Condition Manager",
+	author = "Scag",
+	description = "Condition add and removal control for developers",
+	version = "1.0.0",
 	url = "https://github.com/Scags/"
 };
 
@@ -269,7 +269,7 @@ stock int ReadInt(ptr pAddr)
 {
 	if (pAddr == nullptr)
 		return -1;
-	
+
 	return LoadFromAddress(pAddr, NumberType_Int32);
 }
 stock ptr Transpose(ptr pAddr, int iOffset)
